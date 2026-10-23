@@ -29,6 +29,7 @@ for sdk_target in MMSPlugin.sdk_targets:
     binary.sources += ['src/utils/plat_unix.cpp']
   elif binary.compiler.target.platform == 'windows':
     binary.compiler.postlink += [
+      os.path.join('psapi.lib'),
       os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'funchook.lib'),
       os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'distorm.lib'),
     ]
