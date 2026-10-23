@@ -12,15 +12,26 @@ for sdk_target in MMSPlugin.sdk_targets:
   binary.compiler.cxxincludes += [
     os.path.join(builder.sourcePath, 'src', 'utils'),
     os.path.join(builder.sourcePath, 'public'),
+    os.path.join(builder.sourcePath, 'vendor', 'funchook', 'include'),
   ]
+
+  target_folder = 'Debug' if builder.options.debug else 'Release'
 
   if builder.options.opt == '1':
     if binary.compiler.behavior == 'gcc':
       binary.compiler.cxxflags += ['-g0']
 
   if binary.compiler.target.platform == 'linux':
+    binary.compiler.postlink += [
+      os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'libfunchook.a'),
+      os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'libdistorm.a'),
+    ]
     binary.sources += ['src/utils/plat_unix.cpp']
   elif binary.compiler.target.platform == 'windows':
+    binary.compiler.postlink += [
+      os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'funchook.lib'),
+      os.path.join(builder.sourcePath, 'vendor', 'funchook', 'lib', target_folder, 'distorm.lib'),
+    ]
     binary.sources += ['src/utils/plat_win.cpp']
 
   binary.sources += [

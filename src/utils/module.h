@@ -21,7 +21,6 @@
 #include "dbg.h"
 #include "interface.h"
 #include "tier0/tier0_strtools.h"
-#include "khook.hpp"
 #include "plat.h"
 
 #include <string>
@@ -96,9 +95,46 @@ public:
 #endif
 	}
 
+	// Finds the first match of an IDA-style pattern ("48 8B ? 55"), '?' matches any byte
 	void *LookupSignature(const char *pSignature)
 	{
-		return KHook::LookupSignature(m_base, m_size, pSignature);
+		std::vector<int> pattern;
+
+		for (const char *p = pSignature; *p;)
+		{
+			if (*p == ' ')
+			{
+				p++;
+			}
+			else if (*p == '?')
+			{
+				pattern.push_back(-1);
+				p += (p[1] == '?') ? 2 : 1;
+			}
+			else
+			{
+				char byteStr[3] = { p[0], p[1], '\0' };
+				pattern.push_back((int)strtol(byteStr, nullptr, 16));
+				p += p[1] ? 2 : 1;
+			}
+		}
+
+		if (pattern.empty() || pattern.size() > m_size)
+			return nullptr;
+
+		byte *pMemory = (byte *)m_base;
+
+		for (size_t i = 0; i <= m_size - pattern.size(); i++)
+		{
+			size_t j = 0;
+			while (j < pattern.size() && (pattern[j] == -1 || pMemory[i + j] == pattern[j]))
+				j++;
+
+			if (j == pattern.size())
+				return pMemory + i;
+		}
+
+		return nullptr;
 	}
 
 	void *FindInterface(const char *name)

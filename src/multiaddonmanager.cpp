@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include "multiaddonmanager.h"
 #include "module.h"
+#include "funchook.h"
 #include "utils/plat.h"
 #include "convar.h"
 #include "filesystem/ifilesystem.h"
@@ -214,20 +215,58 @@ CServerSideClientBase *g_pHLTVClientVTable = nullptr;
 MultiAddonManager g_MultiAddonManager;
 PLUGIN_EXPOSE(MultiAddonManager, g_MultiAddonManager);
 
-MultiAddonManager::MultiAddonManager() :
-	m_hookGameFrame(&IServerGameDLL::GameFrame, this, nullptr, &MultiAddonManager::Hook_GameFrame_Post),
-	m_hookStartupServer(&INetworkServerService::StartupServer, this, nullptr, &MultiAddonManager::Hook_StartupServer_Post),
-	m_hookClientConnect(&IServerGameClients::ClientConnect, this, &MultiAddonManager::Hook_ClientConnect, nullptr),
-	m_hookCanHLTVClientConnect(&IServerGameClients::CanHLTVClientConnect, this, &MultiAddonManager::Hook_CanHLTVClientConnect, nullptr),
-	m_hookClientDisconnect(&IServerGameClients::ClientDisconnect, this, nullptr, &MultiAddonManager::Hook_ClientDisconnect_Post),
-	m_hookClientActive(&IServerGameClients::ClientActive, this, nullptr, &MultiAddonManager::Hook_ClientActive_Post),
-	m_hookFireEvent(&IGameEventManager2::FireEvent, this, &MultiAddonManager::Hook_FireEvent, nullptr),
-	m_hookSendNetMessage_ServerSideClient(&CServerSideClientBase::SendNetMessage, this, &MultiAddonManager::Hook_SendNetMessage, nullptr),
-	m_hookSendNetMessage_HLTVClient(&CServerSideClientBase::SendNetMessage, this, &MultiAddonManager::Hook_SendNetMessage, nullptr),
-	m_hookSetPendingHostStateRequest(this, &MultiAddonManager::Hook_SetPendingHostStateRequest, nullptr),
-	m_hookReplyConnection(this, &MultiAddonManager::Hook_ReplyConnection, nullptr),
-	m_hookScriptGetAddon(this, &MultiAddonManager::Hook_ScriptGetAddon, nullptr)
+SH_DECL_HOOK3_void(INetworkServerService, StartupServer, SH_NOATTRIB, 0, const GameSessionConfiguration_t &, ISource2WorldSession *, const char *);
+SH_DECL_HOOK6(IServerGameClients, ClientConnect, SH_NOATTRIB, 0, bool, CPlayerSlot, const char*, uint64, const char *, bool, CBufferString *);
+SH_DECL_HOOK5_void(IServerGameClients, ClientDisconnect, SH_NOATTRIB, false, CPlayerSlot, ENetworkDisconnectionReason, const char *, uint64, const char *);
+SH_DECL_HOOK4_void(IServerGameClients, ClientActive, SH_NOATTRIB, false, CPlayerSlot, bool, const char *, uint64);
+SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
+SH_DECL_HOOK2(IGameEventManager2, FireEvent, SH_NOATTRIB, 0, bool, IGameEvent *, bool);
+SH_DECL_HOOK3(IServerGameClients, CanHLTVClientConnect, SH_NOATTRIB, 0, bool, int, const CSteamID &, int *);
+
+// Detoured with funchook, these point to the trampolines that call the original functions once installed
+bool (FASTCALL *g_pfnSendNetMessage_ServerSideClient)(CServerSideClientBase *, const CNetMessage *, NetChannelBufType_t) = nullptr;
+bool (FASTCALL *g_pfnSendNetMessage_HLTVClient)(CServerSideClientBase *, const CNetMessage *, NetChannelBufType_t) = nullptr;
+void (FASTCALL *g_pfnSetPendingHostStateRequest)(CHostStateMgr *, CHostStateRequest *) = nullptr;
+void (FASTCALL *g_pfnReplyConnection)(INetworkGameServer *, CServerSideClient *) = nullptr;
+uint64 (FASTCALL *g_pfnScriptGetAddon)() = nullptr;
+
+std::vector<funchook_t *> g_vecDetours;
+
+template <typename T>
+void InstallDetour(T *&pfnOriginal, T *pfnDetour)
 {
+	funchook_t *pHook = funchook_create();
+	funchook_prepare(pHook, (void **)&pfnOriginal, (void *)pfnDetour);
+	funchook_install(pHook, 0);
+	g_vecDetours.push_back(pHook);
+}
+
+bool FASTCALL Detour_SendNetMessage_ServerSideClient(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType)
+{
+	g_MultiAddonManager.Hook_SendNetMessage(pClient, pData, bufType);
+	return g_pfnSendNetMessage_ServerSideClient(pClient, pData, bufType);
+}
+
+bool FASTCALL Detour_SendNetMessage_HLTVClient(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType)
+{
+	g_MultiAddonManager.Hook_SendNetMessage(pClient, pData, bufType);
+	return g_pfnSendNetMessage_HLTVClient(pClient, pData, bufType);
+}
+
+void FASTCALL Detour_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHostStateRequest *pRequest)
+{
+	g_MultiAddonManager.Hook_SetPendingHostStateRequest(pMgrDoNotUse, pRequest);
+	g_pfnSetPendingHostStateRequest(pMgrDoNotUse, pRequest);
+}
+
+void FASTCALL Detour_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
+{
+	g_MultiAddonManager.Hook_ReplyConnection(pThis, pClient);
+}
+
+uint64 FASTCALL Detour_ScriptGetAddon()
+{
+	return g_MultiAddonManager.Hook_ScriptGetAddon();
 }
 
 bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late)
@@ -251,35 +290,32 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 
 	bool g_bRequiredInitLoaded = true;
 
-	auto pfnSetPendingHostStateRequest = engineModule.LookupSignature(g_HostStateRequest_Sig);
+	g_pfnSetPendingHostStateRequest = (decltype(g_pfnSetPendingHostStateRequest))engineModule.LookupSignature(g_HostStateRequest_Sig);
 
-	if (!pfnSetPendingHostStateRequest)
+	if (!g_pfnSetPendingHostStateRequest)
 	{
 		Panic("Failed to lookup the signature for HostStateRequest\n");
 		g_bRequiredInitLoaded = false;
 	}
 
-	m_hookSetPendingHostStateRequest.Configure(pfnSetPendingHostStateRequest);
 
-	auto pfnReplyConnection = engineModule.LookupSignature(g_ReplyConnection_Sig);
+	g_pfnReplyConnection = (decltype(g_pfnReplyConnection))engineModule.LookupSignature(g_ReplyConnection_Sig);
 
-	if (!pfnReplyConnection)
+	if (!g_pfnReplyConnection)
 	{
 		Panic("Failed to lookup the signature for ReplyConnection\n");
 		g_bRequiredInitLoaded = false;
 	}
 
-	m_hookReplyConnection.Configure(pfnReplyConnection);
 	
-	auto pfnScriptGetAddon = serverModule.LookupSignature(g_ScriptGetAddon_Sig);
+	g_pfnScriptGetAddon = (decltype(g_pfnScriptGetAddon))serverModule.LookupSignature(g_ScriptGetAddon_Sig);
 
-	if (!pfnScriptGetAddon)
+	if (!g_pfnScriptGetAddon)
 	{
 		Panic("Failed to lookup the signature for ScriptGetAddon\n");
 		g_bRequiredInitLoaded = false;
 	}
 
-	m_hookScriptGetAddon.Configure(pfnScriptGetAddon);
 
 	if (!(g_pGameEventManagerVTable = (IGameEventManager2 *)serverModule.FindVirtualTable("CGameEventManager")))
 	{
@@ -305,15 +341,25 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 		return false;
 	}
 
-	m_hookClientConnect.Add(g_pSource2GameClients);
-	m_hookCanHLTVClientConnect.Add(g_pSource2GameClients);
-	m_hookClientDisconnect.Add(g_pSource2GameClients);
-	m_hookClientActive.Add(g_pSource2GameClients);
-	m_hookGameFrame.Add(g_pSource2Server);
-	m_hookStartupServer.Add(g_pNetworkServerService);
-	m_hookFireEvent.AddGlobal((IGameEventManager2*)&g_pGameEventManagerVTable);
-	m_hookSendNetMessage_ServerSideClient.AddGlobal((CServerSideClientBase*)&g_pServerSideClientVTable);
-	m_hookSendNetMessage_HLTVClient.AddGlobal((CServerSideClientBase*)&g_pHLTVClientVTable);
+	// We're using funchook even though it's a virtual function because it can be called on a different thread and SourceHook isn't thread-safe
+	SourceHook::MemFuncInfo sendNetMessageInfo = {true, -1, 0, 0};
+	SourceHook::GetFuncInfo(&CServerSideClientBase::SendNetMessage, sendNetMessageInfo);
+	g_pfnSendNetMessage_ServerSideClient = (decltype(g_pfnSendNetMessage_ServerSideClient))((void **)g_pServerSideClientVTable)[sendNetMessageInfo.vtblindex];
+	g_pfnSendNetMessage_HLTVClient = (decltype(g_pfnSendNetMessage_HLTVClient))((void **)g_pHLTVClientVTable)[sendNetMessageInfo.vtblindex];
+
+	InstallDetour(g_pfnSetPendingHostStateRequest, Detour_SetPendingHostStateRequest);
+	InstallDetour(g_pfnReplyConnection, Detour_ReplyConnection);
+	InstallDetour(g_pfnScriptGetAddon, Detour_ScriptGetAddon);
+	InstallDetour(g_pfnSendNetMessage_ServerSideClient, Detour_SendNetMessage_ServerSideClient);
+	InstallDetour(g_pfnSendNetMessage_HLTVClient, Detour_SendNetMessage_HLTVClient);
+
+	SH_ADD_HOOK(IServerGameClients, ClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientConnect), false);
+	SH_ADD_HOOK(IServerGameClients, CanHLTVClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_CanHLTVClientConnect), false);
+	SH_ADD_HOOK(IServerGameClients, ClientDisconnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientDisconnect_Post), true);
+	SH_ADD_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive_Post), true);
+	SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame_Post), true);
+	SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer_Post), true);
+	m_iFireEventHookId = SH_ADD_DVPHOOK(IGameEventManager2, FireEvent, g_pGameEventManagerVTable, SH_MEMBER(this, &MultiAddonManager::Hook_FireEvent), false);
 
 	if (g_pEngineServer->IsDedicatedServer())
 	{
@@ -337,15 +383,20 @@ bool MultiAddonManager::Unload(char *error, size_t maxlen)
 	m_CallbackDownloadItemResult.Unregister();
 	m_CallbackSteamServersConnected.Unregister();
 
-	m_hookClientConnect.Remove(g_pSource2GameClients);
-	m_hookCanHLTVClientConnect.Remove(g_pSource2GameClients);
-	m_hookClientDisconnect.Remove(g_pSource2GameClients);
-	m_hookClientActive.Remove(g_pSource2GameClients);
-	m_hookGameFrame.Remove(g_pSource2Server);
-	m_hookStartupServer.Remove(g_pNetworkServerService);
-	m_hookFireEvent.RemoveGlobal((IGameEventManager2*)&g_pGameEventManagerVTable);
-	m_hookSendNetMessage_ServerSideClient.RemoveGlobal((CServerSideClientBase *)&g_pServerSideClientVTable);
-	m_hookSendNetMessage_HLTVClient.RemoveGlobal((CServerSideClientBase *)&g_pHLTVClientVTable);
+	SH_REMOVE_HOOK(IServerGameClients, ClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientConnect), false);
+	SH_REMOVE_HOOK(IServerGameClients, CanHLTVClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_CanHLTVClientConnect), false);
+	SH_REMOVE_HOOK(IServerGameClients, ClientDisconnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientDisconnect_Post), true);
+	SH_REMOVE_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive_Post), true);
+	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame_Post), true);
+	SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer_Post), true);
+	SH_REMOVE_HOOK_ID(m_iFireEventHookId);
+
+	for (funchook_t *pHook : g_vecDetours)
+	{
+		funchook_uninstall(pHook, 0);
+		funchook_destroy(pHook);
+	}
+	g_vecDetours.clear();
 	
 	return true;
 }
@@ -958,7 +1009,7 @@ CON_COMMAND_F(mm_print_searchpaths_client, "Print search paths client-side, only
 	g_pFullFileSystem->PrintSearchPaths();
 }
 
-KHook::Return<void> MultiAddonManager::Hook_StartupServer_Post(INetworkServerService *pThis, const GameSessionConfiguration_t &config, ISource2WorldSession *session, const char *mapname)
+void MultiAddonManager::Hook_StartupServer_Post(const GameSessionConfiguration_t &config, ISource2WorldSession *session, const char *mapname)
 {
 	m_TimedOutClients.clear();
 
@@ -971,11 +1022,9 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer_Post(INetworkServerSer
 	// Note that the actual map VPK(s) and any sub-maps like team_select will be even higher, but those usually don't contain any assets that concern us
 	if (!ParseCfg())
 		RefreshAddons();
-
-	return {KHook::Action::Ignore};
 }
 
-KHook::Return<bool> MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType)
+void MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType)
 {
 	NetMessageInfo_t* info = pData->GetNetMessage()->GetNetMessageInfo();
 
@@ -986,7 +1035,7 @@ KHook::Return<bool> MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase
 	clientInfo.lastActiveTime = Plat_FloatTime();
 
 	if (info->m_MessageId != net_SignonState || !g_pEngineServer->IsDedicatedServer())
-		return {KHook::Action::Ignore};
+		return;
 
 	auto pMsg = const_cast<CNetMessage*>(pData)->ToPB<CNETMsg_SignonState>();
 
@@ -1012,14 +1061,14 @@ KHook::Return<bool> MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase
 			clientInfo.currentPendingAddon = pMsg->addons();
 		}
 
-		return {KHook::Action::Ignore};
+		return;
 	}
 	for (const auto &downloaded : clientInfo.downloadedAddons)
 		RemoveValue(addons, downloaded);
 
 	// Check if client has downloaded everything.
 	if (addons.empty())
-		return { KHook::Action::Ignore };
+		return;
 
 	if (mm_addon_debug.Get())
 		Message("%s: Number of addons remaining to download for %lli: %d\n", __func__, steamID64, (int)addons.size());
@@ -1028,13 +1077,11 @@ KHook::Return<bool> MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase
 	clientInfo.currentPendingAddon = addons.front();
 	pMsg->set_addons(addons.front().c_str());
 	pMsg->set_signon_state(SIGNONSTATE_CHANGELEVEL);
-
-	return {KHook::Action::Ignore};
 }
 
 // pMgrDoNotUse is named as such because the variable is optimized out in Windows builds and will not be passed to the function.
 // The original Windows function just uses the global singleton instead.
-KHook::Return<void> MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHostStateRequest *pRequest)
+void MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHostStateRequest *pRequest)
 {
 	// When IVEngineServer::ChangeLevel is called by the plugin or the server code,
 	// (which happens at the end of a map), the server-defined addon does not change.
@@ -1071,7 +1118,7 @@ KHook::Return<void> MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStat
 		SetCurrentWorkshopMap(pRequest->m_Addons);
 
 	if (m_ExtraAddons.empty())
-		return {KHook::Action::Ignore};
+		return;
 
 	// Rebuild the addon list. We always start with the original addon.
 	if (GetCurrentWorkshopMap().empty())
@@ -1086,8 +1133,6 @@ KHook::Return<void> MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStat
 		newAddons.insert(newAddons.begin(), GetCurrentWorkshopMap());
 		pRequest->m_Addons = VectorToString(newAddons).c_str();
 	}
-
-	return {KHook::Action::Ignore};
 }
 
 void MultiAddonManager::CheckClientAddons(uint64 steamID64)
@@ -1124,37 +1169,33 @@ void MultiAddonManager::CheckClientAddons(uint64 steamID64)
 	return;
 }
 
-KHook::Return<bool> MultiAddonManager::Hook_ClientConnect(IServerGameClients *pThis, CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason )
+bool MultiAddonManager::Hook_ClientConnect(CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason )
 {
 	CheckClientAddons(steamID64);
-	return {KHook::Action::Ignore};
+	RETURN_META_VALUE(MRES_IGNORED, true);
 }
 
-KHook::Return<bool> MultiAddonManager::Hook_CanHLTVClientConnect(IServerGameClients *pThis, int index, const CSteamID &steamID, int *pRejectReason)
+bool MultiAddonManager::Hook_CanHLTVClientConnect(int index, const CSteamID &steamID, int *pRejectReason)
 {
 	CheckClientAddons(steamID.ConvertToUint64());
-	return {KHook::Action::Ignore};
+	RETURN_META_VALUE(MRES_IGNORED, true);
 }
 
-KHook::Return<void> MultiAddonManager::Hook_ClientDisconnect_Post(IServerGameClients *pThis, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
+void MultiAddonManager::Hook_ClientDisconnect_Post(CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
 {
 	// Mark the disconnection time for caching purposes.
 	g_ClientAddons[steamID64].lastActiveTime = Plat_FloatTime();
 	g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
-
-	return {KHook::Action::Ignore};
 }
 
-KHook::Return<void> MultiAddonManager::Hook_ClientActive_Post(IServerGameClients *pThis, CPlayerSlot slot, bool bLoadGame, const char * pszName, uint64 steamID64)
+void MultiAddonManager::Hook_ClientActive_Post(CPlayerSlot slot, bool bLoadGame, const char * pszName, uint64 steamID64)
 {
 	// When the client reaches this stage, they should already have all the necessary addons downloaded, so we can safely remove the downloaded addons list here.
 	if (!mm_cache_clients_with_addons.Get())
 		g_ClientAddons[steamID64].downloadedAddons.clear();
-
-	return {KHook::Action::Ignore};
 }
 
-KHook::Return<void> MultiAddonManager::Hook_GameFrame_Post(IServerGameDLL *pThis, bool simulating, bool bFirstTick, bool bLastTick)
+void MultiAddonManager::Hook_GameFrame_Post(bool simulating, bool bFirstTick, bool bLastTick)
 {
 	static double s_flTime = 0.0f;
 
@@ -1166,7 +1207,7 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame_Post(IServerGameDLL *pThis
 	}
 
 	if (!m_TimedOutClients.size())
-		return {KHook::Action::Ignore};
+		return;
 
 	for (auto pClient : *GetClientList())
 	{
@@ -1178,14 +1219,12 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame_Post(IServerGameDLL *pThis
 			g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
 		}
 	}
-
-	return {KHook::Action::Ignore};
 }
 
-KHook::Return<bool> MultiAddonManager::Hook_FireEvent(IGameEventManager2 *pThis, IGameEvent *event, bool bDontBroadcast)
+bool MultiAddonManager::Hook_FireEvent(IGameEvent *event, bool bDontBroadcast)
 {
 	if (!event)
-		return {KHook::Action::Ignore};
+		RETURN_META_VALUE(MRES_IGNORED, false);
 
 	static int s_iDisconnectId = -1;
 
@@ -1195,12 +1234,12 @@ KHook::Return<bool> MultiAddonManager::Hook_FireEvent(IGameEventManager2 *pThis,
 	// This will prevent "loop shutdown" messages in the chat when clients reconnect
 	// As far as we're aware, there are no other cases where this reason is used
 	if (mm_block_disconnect_messages.Get() && event->GetID() == s_iDisconnectId && event->GetInt("reason") == NETWORK_DISCONNECT_LOOPSHUTDOWN)
-		return {KHook::Action::Supersede, false};
+		RETURN_META_VALUE(MRES_SUPERCEDE, false);
 
-	return {KHook::Action::Ignore};
+	RETURN_META_VALUE(MRES_IGNORED, false);
 }
 
-KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
+void MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
 {
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 	// Clear cache if necessary.
@@ -1227,7 +1266,8 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 		// No addons to send. This means the list of original addons is empty as well.
 		assert(originalAddons.IsEmpty());
 		clientInfo.currentPendingAddon.clear();
-		return {KHook::Action::Ignore};
+		g_pfnReplyConnection(pThis, pClient);
+		return;
 	}
 
 	if (clientInfo.connectedState != CLIENTCONN_CONNECTING)
@@ -1241,7 +1281,7 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 	{
 		// Can't kick right now as this will crash on windows, so defer to the next frame
 		AddTimedOutClient(steamID64);
-		return {KHook::Action::Supersede};
+		return;
 	}
 
 	// Handle the first addon here. The rest should be handled in the SendNetMessage hook.
@@ -1264,22 +1304,20 @@ KHook::Return<void> MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *
 	if (mm_addon_debug.Get())
 		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, addons->Get(), steamID64);
 
-	m_hookReplyConnection.CallOriginal(pThis, pClient);
+	g_pfnReplyConnection(pThis, pClient);
 
 	*addons = originalAddons;
-
-	return {KHook::Action::Supersede};
 }
 
-KHook::Return<uint64> MultiAddonManager::Hook_ScriptGetAddon()
+uint64 MultiAddonManager::Hook_ScriptGetAddon()
 {
 	if (m_ExtraAddons.empty())
-		return {KHook::Action::Ignore};
+		return g_pfnScriptGetAddon();
 
 	uint64 iAddon = GetCurrentWorkshopMap();
 	
 	if (!iAddon)
-		return {KHook::Action::Ignore};
+		return g_pfnScriptGetAddon();
 
-	return {KHook::Action::Supersede, iAddon};
+	return iAddon;
 }

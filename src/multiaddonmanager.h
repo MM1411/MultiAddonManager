@@ -29,7 +29,6 @@
 #include "engine2/ivengineserver2.h"
 #include "engine2/networkgameserverbase.h"
 #include "engine2/serversideclient.h"
-#include "khook.hpp"
 #include "utlvector.h"
 #include <deque>
 #include "networksystem/inetworkserializer.h"
@@ -112,23 +111,21 @@ bool RemoveValue(Container &container, const T &value)
 class MultiAddonManager : public ISmmPlugin, public IMetamodListener, public IMultiAddonManager
 {
 public:
-	MultiAddonManager();
-
 	bool Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late);
 	bool Unload(char *error, size_t maxlen);
 	void *OnMetamodQuery(const char *iface, int *ret);
 public: //hooks
-	KHook::Return<void> Hook_StartupServer_Post(INetworkServerService *pThis, const GameSessionConfiguration_t &config, ISource2WorldSession *, const char *);
-	KHook::Return<bool> Hook_ClientConnect(IServerGameClients *pThis, CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason);
-	KHook::Return<void> Hook_ClientDisconnect_Post(IServerGameClients *pThis, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID);
-	KHook::Return<void> Hook_ClientActive_Post(IServerGameClients *pThis, CPlayerSlot slot, bool bLoadGame, const char *pszName, uint64 steamID64);
-	KHook::Return<void> Hook_GameFrame_Post(IServerGameDLL *pThis, bool simulating, bool bFirstTick, bool bLastTick);
-	KHook::Return<bool> Hook_FireEvent(IGameEventManager2 *pThis, IGameEvent *event, bool bDontBroadcast = false);
-	KHook::Return<bool> Hook_CanHLTVClientConnect(IServerGameClients *pThis, int index, const CSteamID &steamID, int *pRejectReason);
-	KHook::Return<bool> Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType);
-	KHook::Return<void> Hook_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHostStateRequest *pRequest);
-	KHook::Return<void> Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient);
-	KHook::Return<uint64> Hook_ScriptGetAddon();
+	void Hook_StartupServer_Post(const GameSessionConfiguration_t &config, ISource2WorldSession *, const char *);
+	bool Hook_ClientConnect(CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason);
+	void Hook_ClientDisconnect_Post(CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID);
+	void Hook_ClientActive_Post(CPlayerSlot slot, bool bLoadGame, const char *pszName, uint64 steamID64);
+	void Hook_GameFrame_Post(bool simulating, bool bFirstTick, bool bLastTick);
+	bool Hook_FireEvent(IGameEvent *event, bool bDontBroadcast);
+	bool Hook_CanHLTVClientConnect(int index, const CSteamID &steamID, int *pRejectReason);
+	void Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType);
+	void Hook_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHostStateRequest *pRequest);
+	void Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient);
+	uint64 Hook_ScriptGetAddon();
 
 	// Returns true if mm_extra_addons was touched
 	bool ParseCfg();
@@ -174,18 +171,7 @@ public:
 	std::vector<AddonId> m_GlobalClientAddons;
 
 private:
-	KHook::Virtual<IServerGameDLL, void, bool, bool, bool> m_hookGameFrame;
-	KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t &, ISource2WorldSession *, const char *> m_hookStartupServer;
-	KHook::Virtual<IServerGameClients, bool, CPlayerSlot, const char *, uint64, const char *, bool, CBufferString *> m_hookClientConnect;
-	KHook::Virtual<IServerGameClients, bool, int, const CSteamID &, int *> m_hookCanHLTVClientConnect;
-	KHook::Virtual<IServerGameClients, void, CPlayerSlot, ENetworkDisconnectionReason, const char *, uint64, const char *> m_hookClientDisconnect;
-	KHook::Virtual<IServerGameClients, void, CPlayerSlot, bool, const char *, uint64> m_hookClientActive;
-	KHook::Virtual<IGameEventManager2, bool, IGameEvent *, bool> m_hookFireEvent;
-	KHook::Virtual<CServerSideClientBase, bool, const CNetMessage *, NetChannelBufType_t> m_hookSendNetMessage_ServerSideClient;
-	KHook::Virtual<CServerSideClientBase, bool, const CNetMessage *, NetChannelBufType_t> m_hookSendNetMessage_HLTVClient;
-	KHook::Function<void, CHostStateMgr *, CHostStateRequest *> m_hookSetPendingHostStateRequest;
-	KHook::Function<void, INetworkGameServer *, CServerSideClient *> m_hookReplyConnection;
-	KHook::Function<uint64> m_hookScriptGetAddon;
+	int m_iFireEventHookId = -1;
 
 	std::vector<AddonId> m_ImportantDownloads; // Important addon downloads that will trigger a map reload when finished
 	struct AddonDownloadInfo_t
