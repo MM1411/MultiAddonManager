@@ -1,7 +1,7 @@
 /**
  * =============================================================================
  * MultiAddonManager
- * Copyright (C) 2024-2025 xen
+ * Copyright (C) 2024-2026 xen
  * =============================================================================
  *
  * This program is free software; you can redistribute it and/or modify it under
@@ -29,6 +29,7 @@
 #include "engine2/ivengineserver2.h"
 #include "engine2/networkgameserverbase.h"
 #include "engine2/serversideclient.h"
+#include "engine2/hoststate.h"
 #include "utlvector.h"
 #include <deque>
 #include "networksystem/inetworkserializer.h"
@@ -124,7 +125,8 @@ public: //hooks
 	bool Hook_CanHLTVClientConnect(int index, const CSteamID &steamID, int *pRejectReason);
 	void Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType);
 	void Hook_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHostStateRequest *pRequest);
-	void Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient);
+	void Hook_SwitchToLoop(const char *pszLoopModeName, KeyValues *pkvLoopOptions, uint32 nId, const char *pszAddonName, bool bUnk);
+	void Hook_ReplyConnection(CNetworkGameServerBase *pThis, CServerSideClient *pClient);
 	uint64 Hook_ScriptGetAddon();
 
 	// Returns true if mm_extra_addons was touched
@@ -134,15 +136,12 @@ public: //hooks
 	bool UnmountAddon(const char *pszAddon);
 	bool AddAddon(const char *pszAddon, bool bRefresh = false);
 	bool RemoveAddon(const char *pszAddon, bool bRefresh = false);
-	bool IsAddonMounted(const char *pszAddon, bool bCheckWorkshopMap = false) { return Contains(m_MountedAddons, AddonId(pszAddon)) || (bCheckWorkshopMap && GetCurrentWorkshopMap() == AddonId(pszAddon));  }
+	bool IsAddonMounted(const char *pszAddon, bool bCheckWorkshopMap = false) { return Contains(m_MountedAddons, AddonId(pszAddon)) || (bCheckWorkshopMap && m_CurrentWorkshopMap == AddonId(pszAddon));  }
 	bool DownloadAddon(const char *pszAddon, bool bImportant = false, bool bForce = false);
 	void PrintDownloadProgress();
 	void RefreshAddons(bool bReloadMap = false);
 	void ClearAddons();
 	void ReloadMap();
-	AddonId GetCurrentWorkshopMap() { return m_sCurrentWorkshopMap; }
-	void SetCurrentWorkshopMap(const char *pszWorkshopID) { m_sCurrentWorkshopMap = pszWorkshopID; }
-	void ClearCurrentWorkshopMap() { m_sCurrentWorkshopMap.clear(); }
 
 	bool HasUGCConnection();
 	void AddClientAddon(const char *pszAddon, uint64 steamID64 = 0, bool bRefresh = false);
@@ -191,8 +190,8 @@ private:
 
 	bool m_bSteamConnected = false;
 
-	// Used when reloading current map
-	AddonId m_sCurrentWorkshopMap;
+	AddonId m_LoadingWorkshopMap;
+	AddonId m_CurrentWorkshopMap;
 
 	std::set<uint64> m_TimedOutClients;
 };

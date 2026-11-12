@@ -1,7 +1,7 @@
 /**
  * =============================================================================
  * MultiAddonManager
- * Copyright (C) 2024-2025 xen
+ * Copyright (C) 2024-2026 xen
  * =============================================================================
  *
  * This program is free software; you can redistribute it and/or modify it under
@@ -17,16 +17,13 @@
  * this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#include "networkbasetypes.pb.h"
-
-#include <stdio.h>
 #include "multiaddonmanager.h"
+#include "networkbasetypes.pb.h"
 #include "module.h"
 #include "funchook.h"
 #include "utils/plat.h"
 #include "convar.h"
 #include "filesystem/ifilesystem.h"
-#include "steam/steam_gameserver.h"
 #include <string>
 #include <sstream>
 #include <fstream>
@@ -50,7 +47,7 @@ void Message(const char *msg, ...)
 	char buf[1024] = {};
 	V_vsnprintf(buf, sizeof(buf) - 1, msg, args);
 
-	LoggingSystem_Log(2, LS_MESSAGE, Color(0, 255, 200), "[MultiAddonManager] %s", buf);
+	LoggingSystem_Log(2, LS_MESSAGE, Color(0, 255, 200, 255), "[MultiAddonManager] %s", buf);
 
 	va_end(args);
 }
@@ -114,7 +111,7 @@ ISteamUGC *GetSteamUGC()
 }
 
 // Will return null between map end & new map startup, null check if necessary!
-INetworkGameServer* GetNetworkGameServer()
+CNetworkGameServerBase* GetNetworkGameServer()
 {
 	return g_pNetworkServerService->GetIGameServer();
 }
@@ -136,14 +133,9 @@ constexpr const char *g_ReplyConnection_Sig = "48 8B C4 55 41 55 41 56";
 constexpr const char *g_ScriptGetAddon_Sig = "40 56 48 83 EC ? 48 8B 0D ? ? ? ? 48 8D 54 24";
 #else
 constexpr const char *g_HostStateRequest_Sig = "55 48 89 E5 41 56 41 55 41 54 49 89 F4 53 48 83 7F";
-constexpr const char *g_ReplyConnection_Sig = "55 B9 ? ? ? ? 41 B8 ? ? ? ? 48 89 E5";
+constexpr const char *g_ReplyConnection_Sig = "55 41 B8 ? ? ? ? B9 ? ? ? ? 48 89 E5 41 57";
 constexpr const char *g_ScriptGetAddon_Sig = "55 48 89 E5 41 55 41 54 48 8D 75 ? 53 48 83 EC ? 48 8D 05 ? ? ? ? 48 C7 45 ? ? ? ? ? 48 C7 45 ? ? ? ? ? 48 8B 38 48 8B 07 FF 90 ? ? ? ? 8B 55";
 #endif
-
-
-// Offsets
-constexpr int g_iServerAddonsOffset = 376;
-constexpr int g_iClientListOffset = 616;
 
 /* 
 The general workflow is defined as follows:
@@ -183,14 +175,6 @@ struct ClientAddonInfo_t
 
 std::unordered_map<uint64, ClientAddonInfo_t> g_ClientAddons;
 
-CUtlVector<CServerSideClient *> *GetClientList()
-{
-	if (!GetNetworkGameServer())
-		return nullptr;
-
-	return (CUtlVector<CServerSideClient *> *)((char *)GetNetworkGameServer() + g_iClientListOffset);
-}
-
 CConVar<CUtlString> mm_extra_addons("mm_extra_addons", FCVAR_NONE, "The workshop IDs of extra addons separated by commas, addons will be downloaded (if not present) and mounted", CUtlString(""),
 	[](CConVar<CUtlString> *cvar, CSplitScreenSlot slot, const CUtlString *new_val, const CUtlString *old_val)
 	{
@@ -222,12 +206,13 @@ SH_DECL_HOOK4_void(IServerGameClients, ClientActive, SH_NOATTRIB, false, CPlayer
 SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
 SH_DECL_HOOK2(IGameEventManager2, FireEvent, SH_NOATTRIB, 0, bool, IGameEvent *, bool);
 SH_DECL_HOOK3(IServerGameClients, CanHLTVClientConnect, SH_NOATTRIB, 0, bool, int, const CSteamID &, int *);
+SH_DECL_HOOK5_void(IEngineServiceMgr, SwitchToLoop, SH_NOATTRIB, 0, const char *, KeyValues *, uint32, const char *, bool);
 
 // Detoured with funchook, these point to the trampolines that call the original functions once installed
 bool (FASTCALL *g_pfnSendNetMessage_ServerSideClient)(CServerSideClientBase *, const CNetMessage *, NetChannelBufType_t) = nullptr;
 bool (FASTCALL *g_pfnSendNetMessage_HLTVClient)(CServerSideClientBase *, const CNetMessage *, NetChannelBufType_t) = nullptr;
 void (FASTCALL *g_pfnSetPendingHostStateRequest)(CHostStateMgr *, CHostStateRequest *) = nullptr;
-void (FASTCALL *g_pfnReplyConnection)(INetworkGameServer *, CServerSideClient *) = nullptr;
+void (FASTCALL *g_pfnReplyConnection)(CNetworkGameServerBase *, CServerSideClient *) = nullptr;
 uint64 (FASTCALL *g_pfnScriptGetAddon)() = nullptr;
 
 std::vector<funchook_t *> g_vecDetours;
@@ -259,7 +244,7 @@ void FASTCALL Detour_SetPendingHostStateRequest(CHostStateMgr *pMgrDoNotUse, CHo
 	g_pfnSetPendingHostStateRequest(pMgrDoNotUse, pRequest);
 }
 
-void FASTCALL Detour_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
+void FASTCALL Detour_ReplyConnection(CNetworkGameServerBase *pThis, CServerSideClient *pClient)
 {
 	g_MultiAddonManager.Hook_ReplyConnection(pThis, pClient);
 }
@@ -280,7 +265,9 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 	GET_V_IFACE_ANY(GetEngineFactory, g_pNetworkServerService, INetworkServerService, NETWORKSERVERSERVICE_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetEngineFactory, g_pNetworkMessages, INetworkMessages, NETWORKMESSAGES_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetEngineFactory, g_pGameEventSystem, IGameEventSystem, GAMEEVENTSYSTEM_INTERFACE_VERSION);
+	GET_V_IFACE_ANY(GetEngineFactory, g_pEngineServiceMgr, IEngineServiceMgr, ENGINESERVICEMGR_INTERFACE_VERSION);
 	GET_V_IFACE_ANY(GetFileSystemFactory, g_pFullFileSystem, IFileSystem, FILESYSTEM_INTERFACE_VERSION);
+	GET_V_IFACE_ANY(GetEngineFactory, g_pHostStateMgr, IHostStateMgr, HOSTSTATEMGR_INTERFACE_VERSION);
 
 	// Required to get the IMetamodListener events
 	g_SMAPI->AddListener( this, this );
@@ -359,6 +346,7 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 	SH_ADD_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive_Post), true);
 	SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame_Post), true);
 	SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer_Post), true);
+	SH_ADD_HOOK(IEngineServiceMgr, SwitchToLoop, g_pEngineServiceMgr, SH_MEMBER(this, &MultiAddonManager::Hook_SwitchToLoop), false);
 	m_iFireEventHookId = SH_ADD_DVPHOOK(IGameEventManager2, FireEvent, g_pGameEventManagerVTable, SH_MEMBER(this, &MultiAddonManager::Hook_FireEvent), false);
 
 	if (g_pEngineServer->IsDedicatedServer())
@@ -389,6 +377,7 @@ bool MultiAddonManager::Unload(char *error, size_t maxlen)
 	SH_REMOVE_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive_Post), true);
 	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame_Post), true);
 	SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer_Post), true);
+	SH_REMOVE_HOOK(IEngineServiceMgr, SwitchToLoop, g_pEngineServiceMgr, SH_MEMBER(this, &MultiAddonManager::Hook_SwitchToLoop), false);
 	SH_REMOVE_HOOK_ID(m_iFireEventHookId);
 
 	for (funchook_t *pHook : g_vecDetours)
@@ -475,7 +464,7 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail = false
 		return false;
 
 	std::vector<AddonId> serverMountedAddons;
-	StringToVector(this->m_sCurrentWorkshopMap.c_str(), serverMountedAddons);
+	StringToVector(this->m_CurrentWorkshopMap.c_str(), serverMountedAddons);
 	if (Contains(serverMountedAddons, AddonId(pszAddon)))
 	{
 		Message("%s: Addon %s is already mounted by the server\n", __func__, pszAddon);
@@ -687,10 +676,10 @@ void MultiAddonManager::ReloadMap()
 	// Using the concommand here as g_pEngineServer->ChangeLevel doesn't unmount workshop maps and we wanna be clean.
 	// See Hook_SetPendingHostStateRequest's comment for more details.
 	// Community maps are treated like workshop maps but they should still be loaded using changelevel
-	if (m_sCurrentWorkshopMap.empty() || g_pFullFileSystem->IsDirectory(m_sCurrentWorkshopMap.c_str(), "OFFICIAL_ADDONS"))
+	if (m_CurrentWorkshopMap.empty() || g_pFullFileSystem->IsDirectory(m_CurrentWorkshopMap.c_str(), "OFFICIAL_ADDONS"))
 		V_snprintf(cmd, sizeof(cmd), "changelevel %s", GetGlobals()->mapname.ToCStr());
 	else
-		V_snprintf(cmd, sizeof(cmd), "host_workshop_map %s", m_sCurrentWorkshopMap.c_str());
+		V_snprintf(cmd, sizeof(cmd), "host_workshop_map %s", m_CurrentWorkshopMap.c_str());
 
 	g_pEngineServer->ServerCommand(cmd);
 }
@@ -776,17 +765,17 @@ bool MultiAddonManager::RemoveAddon(const char *pszAddon, bool bRefresh)
 
 CNetMessagePB<CNETMsg_SignonState> *GetAddonSignonStateMessage(const char *pszAddon)
 {
-	if (!GetGlobals())
+	if (!GetNetworkGameServer() || !GetGlobals())
 		return nullptr;
 
-	INetworkMessageInternal *pNetMsg = g_pNetworkMessages->FindNetworkMessagePartial("SignonState");
+	auto *pNetMsg = g_pNetworkMessages->FindNetworkMessagePartial("SignonState");
 	CNetMessagePB<CNETMsg_SignonState> *pMsg = pNetMsg->AllocateMessage()->ToPB<CNETMsg_SignonState>();
 	pMsg->set_spawn_count(GetGlobals()->serverCount);
 	pMsg->set_signon_state(SIGNONSTATE_CHANGELEVEL);
 	pMsg->set_addons(pszAddon ? pszAddon : "");
-	auto pClientList = GetClientList();
-	pMsg->set_num_server_players(pClientList->Count());
-	for (auto pClient : *pClientList)
+	auto& clientList = GetNetworkGameServer()->m_Clients;
+	pMsg->set_num_server_players(clientList.Count());
+	for (auto pClient : clientList)
 	{
 		char const *szNetworkId = g_pEngineServer->GetPlayerNetworkIDString(pClient->GetPlayerSlot());
 		pMsg->add_players_networkids(szNetworkId);
@@ -833,7 +822,7 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 			Panic("Failed to create signon state message for %s\n", pszAddon);
 			return;
 		}
-		for (auto pClient : *GetClientList())
+		for (auto pClient : GetNetworkGameServer()->m_Clients)
 		{
 			uint64 clientSteamId = pClient->GetClientSteamID().ConvertToUint64();
 
@@ -915,8 +904,8 @@ void MultiAddonManager::GetClientAddons(std::vector<AddonId> &addons, uint64 ste
 {
 	addons.clear();
 	
-	if (!GetCurrentWorkshopMap().empty())
-		addons.push_back(GetCurrentWorkshopMap());
+	if (!m_CurrentWorkshopMap.empty())
+		addons.push_back(m_CurrentWorkshopMap);
 	// The list of mounted addons should never contain the workshop map.
 	addons.insert(addons.end(), m_MountedAddons.begin(), m_MountedAddons.end());
 	// Also make sure we don't have duplicates.
@@ -1015,15 +1004,14 @@ void MultiAddonManager::Hook_StartupServer_Post(const GameSessionConfiguration_t
 
 void MultiAddonManager::Hook_SendNetMessage(CServerSideClientBase *pClient, const CNetMessage *pData, NetChannelBufType_t bufType)
 {
-	NetMessageInfo_t* info = pData->GetNetMessage()->GetNetMessageInfo();
-
+	auto nMsgId = pData->GetNetMessage()->GetMessageId();
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 	ClientAddonInfo_t& clientInfo = g_ClientAddons[steamID64];
 
 	// If we are sending a message to the client, that means the client is still active.
 	clientInfo.lastActiveTime = Plat_FloatTime();
 
-	if (info->m_MessageId != net_SignonState || !g_pEngineServer->IsDedicatedServer())
+	if (nMsgId != net_SignonState || !g_pEngineServer->IsDedicatedServer())
 		return;
 
 	auto pMsg = const_cast<CNetMessage*>(pData)->ToPB<CNETMsg_SignonState>();
@@ -1076,6 +1064,8 @@ void MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNot
 	// (which happens at the end of a map), the server-defined addon does not change.
 	// Also, host state requests coming from that function will always have "ChangeLevel" in its KV's name.
 	// We can use this information to always be aware of what the original addon is.
+
+	m_LoadingWorkshopMap = m_CurrentWorkshopMap;
 	
 	if (!pRequest->m_pKV)
 	{
@@ -1087,16 +1077,16 @@ void MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNot
 		// Workshop map changes from end of match votes have null keyvalues
 		// ...and when such votes lead to reloading the CURRENT map, m_Addons will also be null, in which case we want to keep the workshop map unchanged
 		if (!pRequest->m_Addons.IsEmpty())
-			SetCurrentWorkshopMap(pRequest->m_Addons);
+			m_LoadingWorkshopMap = pRequest->m_Addons.Get();
 		else if (bValveMap) // Sadly this will include any workshop maps that share names with shipped Valve maps, but at this point there's no way to tell
-			ClearCurrentWorkshopMap();
+			m_LoadingWorkshopMap.clear();
 	}
 	else if (V_stricmp(pRequest->m_pKV->GetName(), "ChangeLevel"))
 	{
 		if (!V_stricmp(pRequest->m_pKV->GetName(), "map_workshop"))
-			SetCurrentWorkshopMap(pRequest->m_pKV->GetString("customgamemode", ""));
+			m_LoadingWorkshopMap = pRequest->m_pKV->GetString("customgamemode", "");
 		else
-			ClearCurrentWorkshopMap();
+			m_LoadingWorkshopMap.clear();
 	}
 
 	// Valve changed the way community maps (like de_dogtown) are loaded
@@ -1104,13 +1094,13 @@ void MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNot
 	// So check if the addon is indeed one of the community maps and keep it, otherwise clients would error out due to missing assets
 	// Each map has its own folder under game/csgo_community_addons which is mounted as "OFFICIAL_ADDONS"
 	if (!pRequest->m_Addons.IsEmpty() && g_pFullFileSystem->IsDirectory(pRequest->m_Addons.String(), "OFFICIAL_ADDONS"))
-		SetCurrentWorkshopMap(pRequest->m_Addons);
+		m_LoadingWorkshopMap = pRequest->m_Addons.Get();
 
 	if (m_ExtraAddons.empty())
 		return;
 
 	// Rebuild the addon list. We always start with the original addon.
-	if (GetCurrentWorkshopMap().empty())
+	if (m_LoadingWorkshopMap.empty())
 	{
 		pRequest->m_Addons = VectorToString(m_ExtraAddons).c_str();
 	}
@@ -1118,10 +1108,18 @@ void MultiAddonManager::Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNot
 	{
 		// Don't add the same addon twice. Hopefully no server owner is diabolical enough to do things like `map de_dust2 customgamemode=1234,5678`.
 		std::vector<AddonId> newAddons = m_ExtraAddons;
-		RemoveValue(newAddons, GetCurrentWorkshopMap());
-		newAddons.insert(newAddons.begin(), GetCurrentWorkshopMap());
+		RemoveValue(newAddons, m_LoadingWorkshopMap);
+		newAddons.insert(newAddons.begin(), m_LoadingWorkshopMap);
 		pRequest->m_Addons = VectorToString(newAddons).c_str();
 	}
+}
+
+void MultiAddonManager::Hook_SwitchToLoop(const char* pszLoopModeName, KeyValues* pkvLoopOptions, uint32 nId, const char* pszAddonName, bool bUnk)
+{
+	if (!V_stricmp(pszLoopModeName, "levelload"))
+		m_CurrentWorkshopMap = m_LoadingWorkshopMap;
+
+	RETURN_META(MRES_IGNORED);
 }
 
 void MultiAddonManager::CheckClientAddons(uint64 steamID64)
@@ -1198,7 +1196,7 @@ void MultiAddonManager::Hook_GameFrame_Post(bool simulating, bool bFirstTick, bo
 	if (!m_TimedOutClients.size())
 		return;
 
-	for (auto pClient : *GetClientList())
+	for (auto pClient : GetNetworkGameServer()->m_Clients)
 	{
 		uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 
@@ -1228,7 +1226,7 @@ bool MultiAddonManager::Hook_FireEvent(IGameEvent *event, bool bDontBroadcast)
 	RETURN_META_VALUE(MRES_IGNORED, false);
 }
 
-void MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerSideClient *pClient)
+void MultiAddonManager::Hook_ReplyConnection(CNetworkGameServerBase *pThis, CServerSideClient *pClient)
 {
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 	// Clear cache if necessary.
@@ -1244,8 +1242,7 @@ void MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerS
 	clientInfo.lastActiveTime = Plat_FloatTime();
 
 	// Server copies the CUtlString from CNetworkGameServer to this client.
-	CUtlString *addons = (CUtlString *)((uintptr_t)pThis + g_iServerAddonsOffset);
-	CUtlString originalAddons = *addons;
+	CUtlString originalAddons = pThis->m_szAddonName;
 
 	// Figure out which addons the client should be loading.
 	std::vector<AddonId> clientAddons;
@@ -1288,25 +1285,20 @@ void MultiAddonManager::Hook_ReplyConnection(INetworkGameServer *pThis, CServerS
 			}),
 		clientAddons.end());
 	
-	*addons = VectorToString(clientAddons).c_str();
+	pThis->m_szAddonName = VectorToString(clientAddons).c_str();
 
 	if (mm_addon_debug.Get())
-		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, addons->Get(), steamID64);
+		Message("%s: Sending addons %s to steamID64 %lli\n", __func__, pThis->m_szAddonName.Get(), steamID64);
 
 	g_pfnReplyConnection(pThis, pClient);
 
-	*addons = originalAddons;
+	pThis->m_szAddonName = originalAddons;
 }
 
 uint64 MultiAddonManager::Hook_ScriptGetAddon()
 {
-	if (m_ExtraAddons.empty())
+	if (m_ExtraAddons.empty() || m_CurrentWorkshopMap.empty())
 		return g_pfnScriptGetAddon();
 
-	uint64 iAddon = GetCurrentWorkshopMap();
-	
-	if (!iAddon)
-		return g_pfnScriptGetAddon();
-
-	return iAddon;
+	return m_CurrentWorkshopMap;
 }
